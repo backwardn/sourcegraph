@@ -1,33 +1,7 @@
 import { Driver } from '../../../../shared/src/e2e/driver'
 import { Config } from '../../../../shared/src/e2e/config'
 import { ElementHandle } from 'puppeteer'
-
-async function setGlobalLSIFSetting(
-    driver: Driver,
-    config: Pick<Config, 'sourcegraphBaseUrl'>,
-    enabled: boolean
-): Promise<void> {
-    await driver.page.goto(`${config.sourcegraphBaseUrl}/site-admin/global-settings`)
-    const globalSettings = `{"codeIntel.lsif": ${enabled}}`
-    await driver.replaceText({
-        selector: '.monaco-editor',
-        newText: globalSettings,
-        selectMethod: 'keyboard',
-        enterTextMethod: 'type',
-    })
-    await (
-        await driver.findElementWithText('Save changes', {
-            selector: 'button',
-            wait: { timeout: 500 },
-        })
-    ).click()
-}
-
-export const enableLSIF = (driver: Driver, config: Pick<Config, 'sourcegraphBaseUrl'>): Promise<void> =>
-    setGlobalLSIFSetting(driver, config, true)
-
-export const disableLSIF = (driver: Driver, config: Pick<Config, 'sourcegraphBaseUrl'>): Promise<void> =>
-    setGlobalLSIFSetting(driver, config, false)
+import { flatten } from 'lodash'
 
 export interface TestCase {
     repoRev: string
@@ -75,9 +49,9 @@ export async function testCodeNavigation(
                 if (expectedReferences) {
                     await (await driver.findElementWithText('Find references')).click()
                     await driver.page.waitForSelector('.e2e-search-result')
-                    const refLinks = await collectLinks(driver, '.e2e-search-result')
+                    const refLinks = await collectLinks(driver)
                     for (const expectedReference of expectedReferences) {
-                        expect(refLinks.includes(expectedReference)).toBeTruthy()
+                        expect(refLinks.has(expectedReference)).toBeTruthy()
                     }
                     await clickOnEmptyPartOfCodeView(driver)
                 }
@@ -86,8 +60,8 @@ export async function testCodeNavigation(
                 await (await driver.findElementWithText('Go to definition')).click()
                 if (Array.isArray(expectedDefinition)) {
                     await driver.page.waitForSelector('.e2e-search-result')
-                    const defLinks = await collectLinks(driver, '.e2e-search-result')
-                    expect(expectedDefinition.every(l => defLinks.includes(l))).toBeTruthy()
+                    const defLinks = await collectLinks(driver)
+                    expect(expectedDefinition.every(l => defLinks.has(l))).toBeTruthy()
                 } else {
                     await driver.page.waitForFunction(
                         defURL => document.location.href.endsWith(defURL),
@@ -107,19 +81,46 @@ async function getTooltip(driver: Driver): Promise<string> {
     return driver.page.evaluate(() => (document.querySelector('.e2e-tooltip-content') as HTMLElement).innerText)
 }
 
-function collectLinks(driver: Driver, selector: string): Promise<string[]> {
-    return driver.page.evaluate(selector => {
-        const links: string[] = []
-        document.querySelectorAll<HTMLElement>(selector).forEach(e => {
-            e.querySelectorAll<HTMLElement>('a[href]').forEach(a => {
-                const href = a.getAttribute('href')
-                if (href) {
-                    links.push(href)
-                }
-            })
-        })
-        return links
-    }, selector)
+async function collectLinks(driver: Driver): Promise<Set<string>> {
+    const panelTabTitles = await getPanelTabTitles(driver)
+    if (panelTabTitles.length === 0) {
+        return new Set(await collectVisibleLinks(driver))
+    }
+
+    const links = new Set<string>()
+    for (const title of panelTabTitles) {
+        const tabElem = await driver.page.$x(
+            `//*[contains(@class, "e2e-hierarchical-locations-view-list")]//*[contains(@title, "${title}")]`
+        )
+        if (tabElem.length > 0) {
+            await tabElem[0].click()
+            await new Promise(r => setTimeout(r, 250)) // TODO - find a more constructive way around this
+        }
+
+        for (const link of await collectVisibleLinks(driver)) {
+            links.add(link)
+        }
+    }
+
+    return links
+}
+
+async function getPanelTabTitles(driver: Driver): Promise<string[]> {
+    return (
+        await Promise.all(
+            (await driver.page.$$('.hierarchical-locations-view > div:nth-child(1) span[title]')).map(e =>
+                e.evaluate(e => e.getAttribute('title') || '')
+            )
+        )
+    ).map(normalizeWhitespace)
+}
+
+function collectVisibleLinks(driver: Driver): Promise<string[]> {
+    return driver.page.evaluate(() =>
+        Array.from(document.querySelectorAll<HTMLElement>('.e2e-search-result')).flatMap(e =>
+            Array.from(e.querySelectorAll<HTMLElement>('a[href]')).map(a => a.getAttribute('href') || '')
+        )
+    )
 }
 
 async function clickOnEmptyPartOfCodeView(driver: Driver): Promise<ElementHandle<Element>[]> {
